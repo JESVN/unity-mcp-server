@@ -183,7 +183,7 @@ export const editorTools = [
         gameObjectPath: { type: "string", description: "Path or name of target GameObject" },
         componentType: { type: "string", description: "Component type name" },
         propertyName: { type: "string", description: "Name of the property to set" },
-        value: { description: "Value to set (type depends on property). For ObjectReference: string asset path, string scene object name, null, or {assetPath?, instanceId?, gameObject?, componentType?}" },
+        value: { type: "string", description: "Value to set. Numeric and boolean strings are coerced automatically. For object references, prefer unity_component_set_reference." },
       },
       required: ["gameObjectPath", "componentType", "propertyName", "value"],
     },

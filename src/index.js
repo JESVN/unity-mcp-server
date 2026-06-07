@@ -130,6 +130,7 @@ console.error(
 // Context auto-inject: each agent gets project context on their first tool call.
 const _contextInjectedPerAgent = new Map(); // agentId → boolean
 let _contextCache = null; // Shared cache (same project context for all agents)
+const AUTO_CONTEXT_INJECTION_ENABLED = process.env.UNITY_MCP_AUTO_CONTEXT === "1";
 
 // Instance auto-discovery: each agent discovers instances on their first tool call.
 const _discoveryDonePerAgent = new Map(); // agentId → boolean
@@ -306,6 +307,121 @@ const TOOLS_SKIP_PORT_INJECT = new Set([
   "unity_list_instances",
 ]);
 
+// Codex currently rejects tool schemas that contain object properties without
+// an explicit JSON Schema shape. Normalize all exposed schemas defensively so
+// one permissive Unity tool definition cannot make the whole MCP tool registry
+// unavailable.
+function normalizeToolSchemaForCodex(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+
+  const clone = JSON.parse(JSON.stringify(schema));
+
+  function compactText(value, maxLength) {
+    if (typeof value !== "string") return value;
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length > maxLength
+      ? `${compact.slice(0, maxLength - 1)}…`
+      : compact;
+  }
+
+  function visit(node, isRoot = false) {
+    if (!node || typeof node !== "object") return;
+
+    // Codex Desktop currently appears to pass the aggregate MCP tool registry
+    // through a Windows process boundary. Large nested parameter descriptions can
+    // push that payload over the CreateProcess command-line limit and make every
+    // MCP server look unavailable. Keep root descriptions compact and drop nested
+    // property descriptions; tool names + required keys still preserve the API.
+    if (typeof node.description === "string") {
+      if (isRoot) {
+        node.description = compactText(node.description, 120);
+      } else {
+        delete node.description;
+      }
+    }
+
+    if (
+      !node.type &&
+      !node.anyOf &&
+      !node.oneOf &&
+      !node.allOf &&
+      !node.$ref &&
+      !node.const &&
+      !node.enum
+    ) {
+      node.type = "string";
+    }
+
+    if (node.type === "object") {
+      if (!node.properties || typeof node.properties !== "object") {
+        if (isRoot) {
+          node.properties = {};
+        } else {
+          node.type = "string";
+          delete node.properties;
+          delete node.additionalProperties;
+          return;
+        }
+      }
+
+      if (node.additionalProperties === undefined) {
+        node.additionalProperties = false;
+      }
+    }
+
+    if (node.properties && typeof node.properties === "object") {
+      for (const prop of Object.values(node.properties)) {
+        visit(prop, false);
+      }
+    }
+
+    if (node.items) visit(node.items, false);
+
+    for (const key of ["anyOf", "oneOf", "allOf"]) {
+      if (Array.isArray(node[key])) {
+        node[key].forEach((entry) => visit(entry, false));
+      }
+    }
+  }
+
+  visit(clone, true);
+  return clone;
+}
+
+function compactToolDescriptionForCodex(description) {
+  if (typeof description !== "string") return description;
+  const compact = description.replace(/\s+/g, " ").trim();
+  return compact.length > 80 ? `${compact.slice(0, 79)}…` : compact;
+}
+
+function parseJsonLikeArguments(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(parseJsonLikeArguments);
+  }
+
+  if (value && typeof value === "object") {
+    const parsed = {};
+    for (const [key, entry] of Object.entries(value)) {
+      parsed[key] = parseJsonLikeArguments(entry);
+    }
+    return parsed;
+  }
+
+  return value;
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: ALL_TOOLS.map(({ name, description, inputSchema }) => {
@@ -328,9 +444,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
         };
-        return { name, description, inputSchema: augmented };
+        return {
+          name,
+          description: compactToolDescriptionForCodex(description),
+          inputSchema: normalizeToolSchemaForCodex(augmented),
+        };
       }
-      return { name, description, inputSchema };
+      return {
+        name,
+        description: compactToolDescriptionForCodex(description),
+        inputSchema: normalizeToolSchemaForCodex(inputSchema),
+      };
     }),
   };
 });
@@ -416,7 +540,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       delete handlerArgs.port;
     }
 
-    const result = await tool.handler(handlerArgs);
+    const result = await tool.handler(parseJsonLikeArguments(handlerArgs));
 
     // Build response content blocks
     const contentBlocks = [];
@@ -427,7 +551,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     // Auto-inject project context on the first successful tool call
-    const contextSummary = await getContextSummaryOnce();
+    const contextSummary = AUTO_CONTEXT_INJECTION_ENABLED
+      ? await getContextSummaryOnce()
+      : null;
     if (contextSummary) {
       contentBlocks.push({ type: "text", text: contextSummary });
     }

@@ -2,7 +2,14 @@
 // Communicates with the C# plugin running inside Unity Editor
 // Supports both queue mode (async ticket-based) and legacy sync mode
 import { CONFIG } from "./config.js";
-import { getActiveBridgeUrl } from "./instance-discovery.js";
+import { existsSync, readdirSync, readFileSync, statSync } from "fs";
+import { basename, join } from "path";
+import {
+  discoverInstances,
+  getActiveBridgeUrl,
+  getActivePort,
+  getSelectedInstance,
+} from "./instance-discovery.js";
 
 // Dynamic bridge URL â€" resolved per-call based on selected instance
 function getBridgeUrl() {
@@ -1664,17 +1671,139 @@ export async function getProjectContext(category = null) {
     ? `${getBridgeUrl()}/api/context/${encodeURIComponent(category)}`
     : `${getBridgeUrl()}/api/context`;
 
-  const response = await fetch(url, {
-    method: "GET",
-    headers: { "X-Agent-Id": _currentAgentId },
-    signal: AbortSignal.timeout(5000),
-  });
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { "X-Agent-Id": _currentAgentId },
+      signal: AbortSignal.timeout(5000),
+    });
 
-  if (!response.ok) {
-    throw new Error(`Context request failed: HTTP ${response.status}`);
+    if (!response.ok) {
+      throw new Error(`Context request failed: HTTP ${response.status}`);
+    }
+
+    return response.json();
+  } catch (error) {
+    const fallback = await getProjectContextFromFiles(category);
+    if (fallback) {
+      fallback.source = "filesystem-fallback";
+      fallback.fallbackReason = error?.message || String(error);
+      return fallback;
+    }
+
+    throw error;
+  }
+}
+
+const STANDARD_CONTEXT_CATEGORIES = [
+  "ProjectGuidelines",
+  "Architecture",
+  "GameDesign",
+  "NetworkingGuidelines",
+  "NetworkingCSP",
+];
+
+async function resolveContextProjectPath() {
+  const selected = getSelectedInstance();
+  if (selected?.projectPath) return selected.projectPath;
+
+  const activePort = getActivePort();
+  const instances = await discoverInstances();
+  const active = instances.find((instance) => instance.port === activePort);
+  if (active?.projectPath) return active.projectPath;
+
+  if (instances.length === 1 && instances[0]?.projectPath) {
+    return instances[0].projectPath;
   }
 
-  return response.json();
+  return null;
+}
+
+function getContextFileList(contextFolder) {
+  if (!contextFolder || !existsSync(contextFolder)) return [];
+
+  const files = [];
+  for (const category of STANDARD_CONTEXT_CATEGORIES) {
+    const filePath = join(contextFolder, `${category}.md`);
+    files.push({ category, filePath, isStandard: true });
+  }
+
+  const customFolder = join(contextFolder, "Custom");
+  if (existsSync(customFolder)) {
+    for (const entry of readdirSync(customFolder)) {
+      if (!entry.toLowerCase().endsWith(".md")) continue;
+      const name = basename(entry, ".md");
+      files.push({
+        category: `Custom/${name}`,
+        filePath: join(customFolder, entry),
+        isStandard: false,
+      });
+    }
+  }
+
+  const standardSet = new Set([...STANDARD_CONTEXT_CATEGORIES, "README"]);
+  for (const entry of readdirSync(contextFolder)) {
+    if (!entry.toLowerCase().endsWith(".md")) continue;
+    const name = basename(entry, ".md");
+    if (standardSet.has(name)) continue;
+    files.push({
+      category: name,
+      filePath: join(contextFolder, entry),
+      isStandard: false,
+    });
+  }
+
+  return files.filter(({ filePath }) => {
+    try {
+      return existsSync(filePath) && statSync(filePath).size > 0;
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function getProjectContextFromFiles(category = null) {
+  const projectPath = await resolveContextProjectPath();
+  if (!projectPath) return null;
+
+  const contextPath = "Assets/MCP/Context";
+  const contextFolder = join(projectPath, contextPath);
+  const files = getContextFileList(contextFolder);
+
+  if (category) {
+    const match = files.find(
+      (file) => file.category === category || file.category === `Custom/${category}`
+    );
+
+    if (!match) {
+      return {
+        error: `Context category '${category}' not found.`,
+        availableCategories: files.map((file) => file.category),
+      };
+    }
+
+    return {
+      category,
+      content: readFileSync(match.filePath, "utf8"),
+      contextPath,
+      projectPath,
+    };
+  }
+
+  const categories = files
+    .map((file) => ({
+      category: file.category,
+      content: readFileSync(file.filePath, "utf8"),
+    }))
+    .filter((entry) => entry.content.trim().length > 0);
+
+  return {
+    enabled: true,
+    contextPath,
+    projectPath,
+    fileCount: categories.length,
+    categories,
+  };
 }
 
 // ─── Testing ───

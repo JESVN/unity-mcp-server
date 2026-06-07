@@ -153,6 +153,50 @@ const CORE_TOOLS = new Set([
   "unity_agent_log",
 ]);
 
+// Codex Desktop on Windows can fail with spawn ENAMETOOLONG when the aggregate
+// MCP tool registry grows too large. Keep a compact direct surface by default;
+// every non-core editor tool remains available through unity_advanced_tool.
+// Set UNITY_MCP_FULL_TOOLS=1 to restore the broader direct core list.
+const CODEX_COMPACT_CORE_TOOLS = new Set([
+  // Connection & state
+  "unity_editor_ping",
+  "unity_editor_state",
+  "unity_project_info",
+
+  // Scene & hierarchy inspection
+  "unity_scene_info",
+  "unity_scene_hierarchy",
+  "unity_scene_stats",
+
+  // Common object/component inspection and edits
+  "unity_gameobject_info",
+  "unity_gameobject_create",
+  "unity_gameobject_set_transform",
+  "unity_component_add",
+  "unity_component_get_properties",
+  "unity_component_set_property",
+  "unity_component_set_reference",
+
+  // Assets/scripts/project diagnostics
+  "unity_asset_list",
+  "unity_search_assets",
+  "unity_search_by_name",
+  "unity_script_read",
+  "unity_console_log",
+  "unity_get_compilation_errors",
+  "unity_play_mode",
+
+  // Visual verification
+  "unity_screenshot_game",
+  "unity_screenshot_scene",
+  "unity_graphics_game_capture",
+  "unity_graphics_scene_capture",
+
+  // Package inspection
+  "unity_packages_list",
+  "unity_packages_info",
+]);
+
 /**
  * Split a flat tool array into { core, advanced }.
  * Also generates the meta-tools for accessing advanced tools.
@@ -160,9 +204,12 @@ const CORE_TOOLS = new Set([
 export function splitToolTiers(allEditorTools) {
   const core = [];
   const advanced = [];
+  const directTools = process.env.UNITY_MCP_FULL_TOOLS === "1"
+    ? CORE_TOOLS
+    : CODEX_COMPACT_CORE_TOOLS;
 
   for (const tool of allEditorTools) {
-    if (CORE_TOOLS.has(tool.name)) {
+    if (directTools.has(tool.name)) {
       core.push(tool);
     } else {
       advanced.push(tool);
